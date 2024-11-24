@@ -2,11 +2,13 @@ import json
 import os
 from clang.cindex import CompilationDatabase
 
+
 # 加载 compile_commands.json
 def load_compile_commands(path):
     comp_db = CompilationDatabase.fromDirectory(path)
     all_compile_commands = comp_db.getAllCompileCommands()
     return all_compile_commands
+
 
 # 加载公共 API
 def load_public_api(path):
@@ -14,6 +16,28 @@ def load_public_api(path):
     compile_commands_path = os.path.join(path, 'public_api.json')
     with open(compile_commands_path, 'r') as file:
         return json.load(file)
+
+
+def is_path_contained_in(base_path, check_path):
+    """
+    判断 check_path 是否位于 base_path 或其子目录中。
+
+    :param base_path: 基准路径（目录）
+    :param check_path: 要检查的路径（文件或目录）
+    :return: True 如果 check_path 位于 base_path 或其子目录中，否则 False
+    """
+    # 转换为绝对路径，确保路径判断的可靠性
+    abs_base_path = os.path.abspath(base_path)
+    abs_check_path = os.path.abspath(check_path)
+
+    # 确保 base_path 是一个目录
+    if not os.path.isdir(abs_base_path):
+        raise ValueError(f"The base_path '{base_path}' is not a valid directory.")
+
+    # 检查 check_path 是否以 base_path 为前缀，表明在目录内
+    return abs_check_path.startswith(abs_base_path + os.sep)
+
+
 
 def process_compile_args(cmd):
     """
