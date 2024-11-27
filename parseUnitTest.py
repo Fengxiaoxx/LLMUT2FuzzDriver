@@ -272,7 +272,7 @@ def parse_source_file_and_get_cursor(cmd: cindex.CompileCommand) -> Tuple[cindex
     return tu.cursor, src_file
 
 
-def main(compile_cmd_dir:str,target_function_call:list,unit_test_dir:str,ignore_type_path:List):
+def main(compile_cmd_dir:str,target_function_call:list,unit_test_dir:str,ignore_type_path:List,ignore_header_path:List):
     compile_cmd = load_compile_commands(compile_cmd_dir)
     file_method_definitions = {}  # 新增字典，用于存储每个文件的方法定义详情
     test_case_info_all = {}
@@ -288,7 +288,9 @@ def main(compile_cmd_dir:str,target_function_call:list,unit_test_dir:str,ignore_
         for cursor in root_cursor.walk_preorder():
 
             if cursor.kind == cindex.CursorKind.INCLUSION_DIRECTIVE and cursor.location.file.name == src_file:
-                include_directives.append(cursor.spelling)
+                include_file = cursor.get_included_file().name
+                if not is_path_contained_in_any(ignore_header_path, include_file):
+                    include_directives.append(cursor.spelling)
 
             if (
                     cursor.kind in (cindex.CursorKind.FUNCTION_DECL, cindex.CursorKind.CXX_METHOD, cindex.CursorKind.FUNCTION_TEMPLATE) and
@@ -304,7 +306,6 @@ def main(compile_cmd_dir:str,target_function_call:list,unit_test_dir:str,ignore_
 
             if cursor.spelling == "TestBody" and parent_class.kind == cindex.CursorKind.CLASS_DECL and cursor.is_definition():
 
-                print("=======================分割线===================================")
                 testCase_num += 1
                 #取本方法定义位置
                 testBody_file = cursor.location.file.name
@@ -342,11 +343,16 @@ def main(compile_cmd_dir:str,target_function_call:list,unit_test_dir:str,ignore_
                         "target_function_called": target_function_calls
                     }
 
-
-
                 else:
                     if final_base_class == "Test": #说明是TEST_F宏
+                        #从测试夹具中获取成员变量和成员函数
+
+                        #从TESTBODY中获取所使用的类型和函数调用
+
+
                         print("这是TEST_F")
+
+
                     elif final_base_class == "TestWithParam": #说明是TEST_P宏
                         print("这是TEST_P")
                     else:
@@ -366,5 +372,9 @@ if __name__ == '__main__':
 
     #指定忽略类型提取路径
     ignore_type_path = ['/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom/third_party']
+
+    #指定忽略头文件提取路径
+    ignore_header_path = ['/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom/third_party','/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom/test']
+
     # 打印提取的每个单元测试文件中的 API 调用
-    main(compile_cmd_dir,target_function_call,unit_test_dir,ignore_type_path)
+    main(compile_cmd_dir,target_function_call,unit_test_dir,ignore_type_path,ignore_header_path)
