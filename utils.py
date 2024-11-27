@@ -38,6 +38,33 @@ def is_path_contained_in(base_path, check_path):
     return abs_check_path.startswith(abs_base_path + os.sep)
 
 
+def is_path_contained_in_any(base_paths, check_path):
+    """
+    判断 check_path 是否位于 base_paths 列表中任意一个路径或其子目录中。
+
+    :param base_paths: 基准路径列表（每个元素是一个目录路径）
+    :param check_path: 要检查的路径（文件或目录）
+    :return: True 如果 check_path 位于 base_paths 中的任意路径或其子目录中，否则 False
+    """
+    # 转换为绝对路径，确保路径判断的可靠性
+    abs_check_path = os.path.abspath(check_path)
+
+    # 检查每个 base_path 是否有效
+    for base_path in base_paths:
+        # 转换为绝对路径
+        abs_base_path = os.path.abspath(base_path)
+
+        # 确保 base_path 是一个目录
+        if not os.path.isdir(abs_base_path):
+            raise ValueError(f"The base_path '{base_path}' is not a valid directory.")
+
+        # 如果 check_path 以 base_path 为前缀，表示位于该目录内
+        if abs_check_path.startswith(abs_base_path + os.sep):
+            return True
+
+    # 如果遍历所有 base_paths 后没有找到符合条件的路径，返回 False
+    return False
+
 
 def process_compile_args(cmd):
     """
@@ -76,3 +103,39 @@ def process_compile_args(cmd):
     cleaned_args.append('-O0')
 
     return cleaned_args
+
+
+import json
+
+
+def write_dict_to_json_in_dir(data_dict: dict, target_dir: str, file_name:str):
+    """
+    将字典内容追加到指定目录的 JSON 文件，文件名为硬编码的 method_definitions.json。
+    如果文件不存在，则创建文件并写入。
+    """
+
+    # 确保目标目录存在
+    if not os.path.exists(target_dir):
+        os.makedirs(target_dir)
+
+    # 组合目标文件路径
+    file_path = os.path.join(target_dir, file_name)
+
+    # 如果文件存在，先读取旧内容并合并
+    if os.path.exists(file_path):
+        with open(file_path, 'r', encoding='utf-8') as json_file:
+            try:
+                existing_data = json.load(json_file)
+            except json.JSONDecodeError:
+                existing_data = {}
+        # 合并字典（旧内容和新内容）
+        if isinstance(existing_data, dict):
+            data_dict = {**existing_data, **data_dict}
+        else:
+            raise ValueError("Existing data is not a dictionary!")
+
+    # 写入合并后的数据
+    with open(file_path, 'w', encoding='utf-8') as json_file:
+        json.dump(data_dict, json_file, indent=4, ensure_ascii=False)
+
+
