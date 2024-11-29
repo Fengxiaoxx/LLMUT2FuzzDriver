@@ -1,10 +1,214 @@
 from utils import load_compile_commands, load_public_api, process_compile_args, is_path_contained_in, write_dict_to_json_in_dir, is_path_contained_in_any
 from clang import cindex  # 导入 Clang 的 Python 接口模块
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Set
 import os
 
 # 设置 Clang 库的路径
 cindex.Config.set_library_file('/usr/lib/llvm-15/lib/libclang.so.1')
+
+
+from clang.cindex import Cursor
+
+
+def analyze_test_p_macro(
+        cursor: cindex.Cursor,
+        class_cursor_list: List[cindex.Cursor],
+        target_function_call: Dict[str, Any],
+        unit_test_dir: str,
+        ignore_type_path: List[str],
+        testBody_definition_info: Dict[str, Any],
+        include_directives: Set[str],
+        macro: str
+) -> Dict[str, Any]:
+
+    fixture_class_info_list: List[Dict[str, Any]] = []  # 存储测试夹具中的信息
+
+    # 解析 testbody
+    testbody: Dict[str, Any] = build_testbody(
+        cursor=cursor,
+        target_function_call=target_function_call,
+        unit_test_dir=unit_test_dir,
+        ignore_type_path=ignore_type_path,
+        testBody_definition_info=testBody_definition_info
+    )
+
+    # 解析测试夹具
+    for class_cursor in class_cursor_list[1:]:  # 取每个测试夹具的源码
+        fixture_class_name: str = class_cursor.spelling
+        cxx_method_not_def_in_class: List[Dict[str, Any]] = []  # 用来存储类中没有定义的成员函数
+        type_def_list_in_fixture: List[Dict[str, Any]] = []  # 存储测试夹具中引用的类型
+
+        # 取其定义位置
+        test_fixture_decl: Dict[str, Any] = {
+            "file": class_cursor.location.file.name if class_cursor.location.file else "",
+            "start_line": class_cursor.extent.start.line,
+            "end_line": class_cursor.extent.end.line
+        }
+
+        # 取成员函数
+        cxx_method_type = (
+            cindex.CursorKind.CXX_METHOD,
+            cindex.CursorKind.FUNCTION_TEMPLATE,
+            cindex.CursorKind.CONSTRUCTOR,
+            cindex.CursorKind.DESTRUCTOR
+        )
+
+        for child in class_cursor.walk_preorder():
+            field_type_in_fixture: List[cindex.Type] = []  # 存储在测试夹具中被使用的类型
+
+            # 分析成员变量
+            if child.kind == cindex.CursorKind.FIELD_DECL:
+                for filed_child in child.get_children():
+                    if filed_child.kind == cindex.CursorKind.TYPE_REF:
+                        field_type_in_fixture.append(filed_child.referenced)
+
+            for field_type_ref in field_type_in_fixture:
+                field_type_def = get_type_ref_definition(field_type_ref)
+                type_def_list_in_fixture.append(field_type_def)
+
+            # 分析成员函数
+            if child.kind in cxx_method_type:
+                # 成员函数名
+                cxxmethod_name: str = child.spelling
+                cxxmethod_info_list: List[Dict[str, Any]] = []
+                if not child.is_definition():
+                    # 获取定义
+                    child_definition: Optional[cindex.Cursor] = child.get_definition()
+
+                    if child_definition is not None:
+                        # 定义在当前文件
+                        cxx_method_definition_info: Dict[str, Any] = {
+                            "isSrcCode": True,
+                            "file": child_definition.location.file.name if child_definition.location.file else "",
+                            "start_line": child_definition.extent.start.line,
+                            "end_line": child_definition.extent.end.line
+                        }
+                    else:
+                        # 获取引用
+                        child_reference: Optional[cindex.Cursor] = child.referenced
+                        if child_reference is not None:
+                            cxx_method_definition_info = {
+                                "isSrcCode": child_reference.is_definition(),
+                                "file": child_reference.location.file.name if child_reference.location.file else "",
+                                "start_line": child_reference.extent.start.line,
+                                "end_line": child_reference.extent.end.line
+                            }
+                        else:
+                            # 如果引用也不存在，不记录
+                            cxx_method_definition_info = None
+
+                    if cxx_method_definition_info:
+                        cxx_method_not_def_in_class.append(cxx_method_definition_info)
+
+                # 如果 child 是定义，提取取函数调用信息
+                else:
+                    cxxmethod_info: Dict[str, Any] = build_cxxmethod(
+                        cursor=cursor,
+                        target_function_call=target_function_call,
+                        unit_test_dir=unit_test_dir,
+                        ignore_type_path=ignore_type_path,
+                        cxxmethod_name=cxxmethod_name
+                    )
+                    cxxmethod_info_list.append(cxxmethod_info)
+
+        fixture_info: Dict[str, Any] = {
+            "fixture_class_name": fixture_class_name,
+            "fixtur_definition": test_fixture_decl,
+            "cxx_method_not_def_in_class": cxx_method_not_def_in_class,
+            "aux_function_in_cxxmethod": cxxmethod_info_list,
+            "type_def_list_in_fixture": type_def_list_in_fixture,
+        }
+        fixture_class_info_list.append(fixture_info)
+
+    # 生成键名并存储数据
+    test_case: Dict[str, Any] = {
+        "macro": macro,
+        "include_directives": list(include_directives),
+        "testbody": testbody,  # 使用提前定义的 testbody
+        "fixture_class": fixture_class_info_list
+    }
+
+    return test_case
+
+
+def build_cxxmethod(
+    cursor: Cursor,
+    target_function_call: List[str],
+    unit_test_dir: str,
+    ignore_type_path: List[str],
+    cxxmethod_name: str
+) -> Dict[str, Any]:
+
+    # 初始化辅助函数和类型定义列表
+    aux_function_definition_list: List[Dict[str, Any]] = []
+    type_definition_list: List[Dict[str, Any]] = []
+
+    # 获取目标函数调用、自定义辅助函数及类型引用
+    target_function_calls: List[Dict[str, Any]]
+    aux_function_cursor_list: List[Cursor]
+    type_ref_list: List[Cursor]
+
+    (
+        target_function_calls,
+        aux_function_cursor_list,
+        type_ref_list
+    ) = collect_function_call_details(cursor, target_function_call, unit_test_dir, ignore_type_path)
+
+    # 填充辅助函数定义列表
+    for aux_function_cursor in aux_function_cursor_list:
+        aux_function_definition_list.append(get_aux_function_definition(aux_function_cursor))
+
+    # 填充类型定义列表
+    for type_ref in type_ref_list:
+        type_definition_list.append(get_type_ref_definition(type_ref))
+
+    # 构造 testbody 字典
+    return {
+        "cxxmethod_name":cxxmethod_name,
+        "aux_function_definition_list": aux_function_definition_list,
+        "type_definition_list": type_definition_list,
+        "target_function_called": target_function_calls,
+    }
+
+
+def build_testbody(
+    cursor: Cursor,
+    target_function_call: List[str],
+    unit_test_dir: str,
+    ignore_type_path: List[str],
+    testBody_definition_info: Dict[str, Any],
+) -> Dict[str, Any]:
+
+    # 初始化辅助函数和类型定义列表
+    aux_function_definition_list: List[Dict[str, Any]] = []
+    type_definition_list: List[Dict[str, Any]] = []
+
+    # 获取目标函数调用、自定义辅助函数及类型引用
+    target_function_calls: List[Dict[str, Any]]
+    aux_function_cursor_list: List[Cursor]
+    type_ref_list: List[Cursor]
+
+    (
+        target_function_calls,
+        aux_function_cursor_list,
+        type_ref_list
+    ) = collect_function_call_details(cursor, target_function_call, unit_test_dir, ignore_type_path)
+
+    # 填充辅助函数定义列表
+    for aux_function_cursor in aux_function_cursor_list:
+        aux_function_definition_list.append(get_aux_function_definition(aux_function_cursor))
+
+    # 填充类型定义列表
+    for type_ref in type_ref_list:
+        type_definition_list.append(get_type_ref_definition(type_ref))
+
+    # 构造 testbody 字典
+    return {
+        "testBody_definition_info": testBody_definition_info,
+        "aux_function_definition_list": aux_function_definition_list,
+        "type_definition_list": type_definition_list,
+        "target_function_called": target_function_calls,
+    }
 
 
 def get_type_ref_definition(cursor_reference: cindex.Cursor) -> Dict:
@@ -64,17 +268,14 @@ def get_aux_function_definition(cursor_reference: cindex.Cursor) -> Optional[Dic
         return None
 
     try:
-        if cursor_reference.is_definition():
-            flag = True
-        else:
-            flag = False
+        isSrcCode = cursor_reference.is_definition()
 
         if cursor_reference.location.file and cursor_reference.extent:
             aux_function_info = {
                 'file': cursor_reference.location.file.name,
                 'start_line': cursor_reference.extent.start.line,
                 'end_line': cursor_reference.extent.end.line,
-                'isSrcCode': flag
+                'isSrcCode': isSrcCode
             }
             return aux_function_info
         else:
@@ -116,7 +317,11 @@ def is_valid_type_ref(referenced: cindex.Cursor) -> bool:
         return False
     return True
 
-def collect_function_call_details(testBody: cindex.Cursor, target_function_call: List, unit_test_dir: str, ignore_type_path:List) -> Tuple[List[str], List[cindex.Cursor], List[cindex.Cursor]]:
+def collect_function_call_details(
+        testBody: cindex.Cursor,
+        target_function_call: List,
+        unit_test_dir: str,
+        ignore_type_path:List) -> Tuple[List[str], List[cindex.Cursor], List[cindex.Cursor]]:
     if not testBody or not target_function_call:
         return [], [], []
 
@@ -224,7 +429,9 @@ def is_derived_from_testing_test(class_cursor: cindex.Cursor) -> bool:
 
     # 遍历基类
     for base_class in class_cursor.get_children():
+
         if base_class.kind == cindex.CursorKind.CXX_BASE_SPECIFIER:
+
             try:
                 # 获取基类类型
                 base_type = base_class.type
@@ -281,16 +488,10 @@ def main(compile_cmd_dir:str,target_function_call:list,unit_test_dir:str,ignore_
 
         root_cursor,src_file = parse_source_file_and_get_cursor(cmd)  # 获取某个单元测试的 AST 的根游标
         method_definitions = []  # 存储当前文件的自定义详情
-        testCase_num = 0 #对测试用例编号
-        test_case_info_file = {} #存储每个文件内测试用例信息
-        include_directives = []
+        test_case_info_file = [] #存储每个文件内测试用例信息
+        include_directives = set()
 
         for cursor in root_cursor.walk_preorder():
-
-            if cursor.kind == cindex.CursorKind.INCLUSION_DIRECTIVE and cursor.location.file.name == src_file:
-                include_file = cursor.get_included_file().name
-                if not is_path_contained_in_any(ignore_header_path, include_file):
-                    include_directives.append(cursor.spelling)
 
             if (
                     cursor.kind in (cindex.CursorKind.FUNCTION_DECL, cindex.CursorKind.CXX_METHOD, cindex.CursorKind.FUNCTION_TEMPLATE) and
@@ -298,16 +499,19 @@ def main(compile_cmd_dir:str,target_function_call:list,unit_test_dir:str,ignore_
                     cursor.location.file.name == src_file and
                     cursor.spelling != "TestBody"
             ):
-
                 method_definition_detail = pack_function_definitions(cursor)
                 method_definitions.append(method_definition_detail)
 
-            parent_class = cursor.semantic_parent
+            #取引入的头文件
+            if cursor.kind == cindex.CursorKind.INCLUSION_DIRECTIVE and is_path_contained_in(unit_test_dir, cursor.location.file.name) :
+                include_file = cursor.get_included_file().name
+                if not is_path_contained_in_any(ignore_header_path, include_file):
+                    include_directives.add(cursor.spelling)
 
+            parent_class = cursor.semantic_parent
             if cursor.spelling == "TestBody" and parent_class.kind == cindex.CursorKind.CLASS_DECL and cursor.is_definition():
 
-                testCase_num += 1
-                #取本方法定义位置
+                # 取本方法定义位置
                 testBody_file = cursor.location.file.name
                 testBody_start_line = cursor.extent.start.line
                 testBody_end_line = cursor.extent.end.line
@@ -318,45 +522,57 @@ def main(compile_cmd_dir:str,target_function_call:list,unit_test_dir:str,ignore_
                     "end_line": testBody_end_line
                 }
 
-                final_base_class,class_cursor_list = get_final_gtest_base_class(parent_class,root_cursor) #final_base_class表示最终的基类，class_cursor_list表示所有被访问到的基类
+                # 获取最终基类及其链表
+                final_base_class, class_cursor_list = get_final_gtest_base_class(parent_class, root_cursor)
 
-                if is_derived_from_testing_test(parent_class): #通过TestBody所属类是否直接继承自::testing::TEST类来判断宏的类型
-                    aux_function_definition_list = []
-                    type_definition_list = []
+                # 对 TEST 宏进行分析
+                if is_derived_from_testing_test(parent_class):  # 判断是否直接继承自 ::testing::TEST
+                    testbody =  build_testbody(
+                                cursor=cursor,
+                                target_function_call=target_function_call,
+                                unit_test_dir=unit_test_dir,
+                                ignore_type_path=ignore_type_path,
+                                testBody_definition_info=testBody_definition_info
+                            )
 
-                    target_function_calls, aux_function_cursor_list ,type_ref_list = collect_function_call_details(cursor,target_function_call,unit_test_dir,ignore_type_path) # 获取待测目标函数调用和自定义辅助函数
-
-                    for aux_function_cursor in aux_function_cursor_list:
-                        aux_function_definition_list.append(get_aux_function_definition(aux_function_cursor))
-
-                    for type_ref in type_ref_list:
-                        type_definition_list.append(get_type_ref_definition(type_ref))
-
-                     # 生成键名并存储数据
-                    test_case_key = f'testCase_{testCase_num}'  # 动态生成键
-                    test_case_info_file[test_case_key] = {
-                        "macro":"TEST",
-                        "include_directives":include_directives,
-                        "testBody_definition_info": testBody_definition_info,
-                        "aux_function_definition_list": aux_function_definition_list,
-                        "type_definition_list": type_definition_list,
-                        "target_function_called": target_function_calls
+                    test_case = {
+                        "macro": "TEST",
+                        "include_directives": list(include_directives),
+                        "testbody": testbody,  # 使用提前定义的 testbody
                     }
+
+                    test_case_info_file.append(test_case)
 
                 else:
                     if final_base_class == "Test": #说明是TEST_F宏
-                        #从测试夹具中获取成员变量和成员函数
+                        macro = "TEST_F"
+                        test_case = analyze_test_p_macro(
+                            cursor=cursor,
+                            class_cursor_list=class_cursor_list,
+                            target_function_call=target_function_call,
+                            unit_test_dir=unit_test_dir,
+                            ignore_type_path=ignore_type_path,
+                            testBody_definition_info=testBody_definition_info,
+                            include_directives=include_directives,
+                            macro=macro
+                        )
+                        test_case_info_file.append(test_case)
 
-                        #从TESTBODY中获取所使用的类型和函数调用
-
-
-                        print("这是TEST_F")
-
-
+                    #对TESST_P宏分析
                     elif final_base_class == "TestWithParam": #说明是TEST_P宏
-                        print("这是TEST_P")
-                    else:
-                        print("无")
+                        macro = "TEST_P"
+                        test_case = analyze_test_p_macro(
+                            cursor=cursor,
+                            class_cursor_list=class_cursor_list,
+                            target_function_call=target_function_call,
+                            unit_test_dir=unit_test_dir,
+                            ignore_type_path=ignore_type_path,
+                            testBody_definition_info=testBody_definition_info,
+                            include_directives=include_directives,
+                            macro=macro
+                        )
+                        test_case_info_file.append(test_case)
+
 
         file_method_definitions[src_file] = method_definitions
         test_case_info_all[src_file] = test_case_info_file
