@@ -1,13 +1,45 @@
 from utils import load_compile_commands, load_public_api, process_compile_args, is_path_contained_in, write_dict_to_json_in_dir, is_path_contained_in_any
+from clang.cindex import Cursor
 from clang import cindex  # 导入 Clang 的 Python 接口模块
 from typing import List, Tuple, Optional, Dict, Any, Set
 import os
+from tqdm import tqdm
 
 # 设置 Clang 库的路径
 cindex.Config.set_library_file('/usr/lib/llvm-15/lib/libclang.so.1')
 
 
-from clang.cindex import Cursor
+def get_function_call_graph(cursor: cindex.Cursor, unit_test_dir: str) -> List[str]:
+
+    called_function_list = []
+
+    if cursor.is_definition():
+        for child in cursor.walk_preorder():
+            # 检查当前节点是否是函数调用
+            if child.kind == cindex.CursorKind.CALL_EXPR:
+                referenced = child.referenced
+                if referenced is not None and referenced.location.file is not None:
+                    try:
+                        referenced_path = referenced.location.file.name
+                        # 检查路径是否在指定目录中
+                        if is_path_contained_in(unit_test_dir, referenced_path):
+                            called_function_name = referenced.spelling
+                            # 检查是否有定义
+                            definition = referenced.get_definition()
+                            if definition is not None and definition.location.file is not None:
+                                called_function_def_file = definition.location.file.name
+                                file_without_extension = os.path.splitext(called_function_def_file)[0]
+                                # 拼接函数标识符
+                                function_identifier = f"{file_without_extension} | {called_function_name}"
+                                called_function_list.append(function_identifier)
+                    except AttributeError as e:
+                        # 捕获可能的异常，例如引用或定义的属性不存在
+                        print(f"AttributeError encountered: {e}")
+                    except Exception as e:
+                        # 捕获其他异常并打印日志以供调试
+                        print(f"Unexpected error encountered: {e}")
+
+    return called_function_list
 
 
 def analyze_test_p_macro(
@@ -45,6 +77,9 @@ def analyze_test_p_macro(
             "end_line": class_cursor.extent.end.line
         }
 
+        # Initialize cxxmethod_info_list before the loop
+        cxxmethod_info_list: List[Dict[str, Any]] = []
+
         # 取成员函数
         cxx_method_type = (
             cindex.CursorKind.CXX_METHOD,
@@ -70,7 +105,8 @@ def analyze_test_p_macro(
             if child.kind in cxx_method_type:
                 # 成员函数名
                 cxxmethod_name: str = child.spelling
-                cxxmethod_info_list: List[Dict[str, Any]] = []
+                # Remove this line
+                # cxxmethod_info_list: List[Dict[str, Any]] = []
                 if not child.is_definition():
                     # 获取定义
                     child_definition: Optional[cindex.Cursor] = child.get_definition()
@@ -100,7 +136,7 @@ def analyze_test_p_macro(
                     if cxx_method_definition_info:
                         cxx_method_not_def_in_class.append(cxx_method_definition_info)
 
-                # 如果 child 是定义，提取取函数调用信息
+                # 如果 child 是定义，提取函数调用信息
                 else:
                     cxxmethod_info: Dict[str, Any] = build_cxxmethod(
                         cursor=cursor,
@@ -129,6 +165,7 @@ def analyze_test_p_macro(
     }
 
     return test_case
+
 
 
 def build_cxxmethod(
@@ -360,17 +397,21 @@ def collect_function_call_details(
 def get_final_gtest_base_class(
     class_cursor: cindex.Cursor,
     root_cursor: cindex.Cursor,
+    class_def_list: List,
     checked_classes=None,
-    class_cursor_list = []
+    class_cursor_list=None,
 ) -> Tuple[str, List[cindex.Cursor]]:
-
-    base_class_list = []
-    result_final = 'None'
-
-    class_cursor_list.append(class_cursor)  # 保存当前类的 cursor
 
     if checked_classes is None:
         checked_classes = set()
+
+    if class_cursor_list is None:
+        class_cursor_list = []  # 在初始调用时创建新的列表
+
+    class_cursor_list.append(class_cursor)  # 保存当前类的 cursor
+
+    base_class_list = []
+    result_final = 'None'
 
     # 确保输入是类声明
     if class_cursor.kind not in [cindex.CursorKind.CLASS_DECL, cindex.CursorKind.CLASS_TEMPLATE]:
@@ -383,9 +424,10 @@ def get_final_gtest_base_class(
     checked_classes.add(class_usr)
 
     # 查找当前类的所有基类
-    for cursor in root_cursor.walk_preorder():
-        if cursor.spelling == class_cursor.spelling and cursor.kind in [cindex.CursorKind.CLASS_DECL, cindex.CursorKind.CLASS_TEMPLATE]:
-            base_class_list.append(cursor)
+    for class_def in class_def_list:
+        if class_def.spelling == class_cursor.spelling:
+            base_class_list.append(class_def)
+            break
 
     # 遍历基类的子节点
     for base_cursor in base_class_list:
@@ -400,9 +442,9 @@ def get_final_gtest_base_class(
                 elif base_usr.startswith('c:@N@testing@ST>1#T@TestWithParam'):
                     result_final = 'TestWithParam'
                 else:
-                    # 递归检查基类
-                    result, child_visited = get_final_gtest_base_class(
-                        base_decl, root_cursor, checked_classes,class_cursor_list
+                    # 递归检查基类，显式传递 class_cursor_list
+                    result, _ = get_final_gtest_base_class(
+                        base_decl, root_cursor, class_def_list, checked_classes, class_cursor_list
                     )
 
                     if result != 'None':
@@ -479,106 +521,165 @@ def parse_source_file_and_get_cursor(cmd: cindex.CompileCommand) -> Tuple[cindex
     return tu.cursor, src_file
 
 
-def main(compile_cmd_dir:str,target_function_call:list,unit_test_dir:str,ignore_type_path:List,ignore_header_path:List):
+def process_cursor(cursor, root_cursor, src_file, method_definitions, test_case_info_file, include_directives, class_cursor_list, call_graph_all, unit_test_dir, target_function_call, ignore_type_path, ignore_header_path):
+    """
+    递归地处理游标及其子游标，针对 namespace 和 class 进行深入遍历
+    """
+    # 用来辅助查找基类
+    if cursor.kind in [cindex.CursorKind.CLASS_DECL, cindex.CursorKind.CLASS_TEMPLATE]:
+        class_cursor_list.append(cursor)
+
+    # 处理函数定义（非 TestBody）
+    if (
+        cursor.kind in (cindex.CursorKind.FUNCTION_DECL, cindex.CursorKind.CXX_METHOD, cindex.CursorKind.FUNCTION_TEMPLATE) and
+        cursor.is_definition() and
+        cursor.location.file.name == src_file and
+        cursor.spelling != "TestBody"
+    ):
+        method_definition_detail = pack_function_definitions(cursor)
+        method_definitions.append(method_definition_detail)
+
+        function_name = cursor.spelling
+        function_file_without_extension = os.path.splitext(src_file)[0]
+        function_identifier = f"{function_file_without_extension} | {function_name}"
+        called_list = get_function_call_graph(cursor, unit_test_dir)
+        call_graph_all[function_identifier] = called_list  # 确保 call_graph_all 已经作为参数传入
+
+    # 取引入的头文件
+    if cursor.kind == cindex.CursorKind.INCLUSION_DIRECTIVE and is_path_contained_in(unit_test_dir, cursor.location.file.name):
+        include_file = cursor.get_included_file().name
+        if not is_path_contained_in_any(ignore_header_path, include_file):
+            include_directives.add(cursor.spelling)
+
+    # 处理 TestBody
+    parent_class = cursor.semantic_parent
+    if cursor.spelling == "TestBody" and parent_class.kind == cindex.CursorKind.CLASS_DECL and cursor.is_definition():
+
+        # 取本方法定义位置
+        testBody_file = cursor.location.file.name
+        testBody_start_line = cursor.extent.start.line
+        testBody_end_line = cursor.extent.end.line
+
+        testBody_definition_info = {
+            "file": testBody_file,
+            "start_line": testBody_start_line,
+            "end_line": testBody_end_line
+        }
+
+        # 获取最终基类及其链表
+        final_base_class, class_cursor_list = get_final_gtest_base_class(parent_class, root_cursor, class_cursor_list)
+
+        # 对 TEST 宏进行分析
+        if is_derived_from_testing_test(parent_class):  # 判断是否直接继承自 ::testing::TEST
+            testbody = build_testbody(
+                cursor=cursor,
+                target_function_call=target_function_call,
+                unit_test_dir=unit_test_dir,
+                ignore_type_path=ignore_type_path,
+                testBody_definition_info=testBody_definition_info
+            )
+
+            test_case = {
+                "macro": "TEST",
+                "include_directives": list(include_directives),
+                "testbody": testbody,  # 使用提前定义的 testbody
+            }
+
+            test_case_info_file.append(test_case)
+
+        else:
+            if final_base_class == "Test":  # 说明是 TEST_F 宏
+                macro = "TEST_F"
+                test_case = analyze_test_p_macro(
+                    cursor=cursor,
+                    class_cursor_list=class_cursor_list,
+                    target_function_call=target_function_call,
+                    unit_test_dir=unit_test_dir,
+                    ignore_type_path=ignore_type_path,
+                    testBody_definition_info=testBody_definition_info,
+                    include_directives=include_directives,
+                    macro=macro
+                )
+                test_case_info_file.append(test_case)
+
+            elif final_base_class == "TestWithParam":  # 说明是 TEST_P 宏
+                macro = "TEST_P"
+                test_case = analyze_test_p_macro(
+                    cursor=cursor,
+                    class_cursor_list=class_cursor_list,
+                    target_function_call=target_function_call,
+                    unit_test_dir=unit_test_dir,
+                    ignore_type_path=ignore_type_path,
+                    testBody_definition_info=testBody_definition_info,
+                    include_directives=include_directives,
+                    macro=macro
+                )
+                test_case_info_file.append(test_case)
+
+    # 如果是 namespace 或 class，则递归遍历其子节点
+    if cursor.kind in [cindex.CursorKind.NAMESPACE, cindex.CursorKind.CLASS_DECL, cindex.CursorKind.CLASS_TEMPLATE]:
+        for child in cursor.get_children():
+            process_cursor(
+                cursor=child,
+                root_cursor=root_cursor,
+                src_file=src_file,
+                method_definitions=method_definitions,
+                test_case_info_file=test_case_info_file,
+                include_directives=include_directives,
+                class_cursor_list=class_cursor_list,
+                call_graph_all=call_graph_all,
+                unit_test_dir=unit_test_dir,
+                target_function_call=target_function_call,
+                ignore_type_path=ignore_type_path,
+                ignore_header_path=ignore_header_path
+            )
+
+def main(compile_cmd_dir:str, target_function_call:list, unit_test_dir:str, ignore_type_path:List, ignore_header_path:List):
     compile_cmd = load_compile_commands(compile_cmd_dir)
-    file_method_definitions = {}  # 新增字典，用于存储每个文件的方法定义详情
-    test_case_info_all = {}
 
-    for cmd in compile_cmd:
 
-        root_cursor,src_file = parse_source_file_and_get_cursor(cmd)  # 获取某个单元测试的 AST 的根游标
-        method_definitions = []  # 存储当前文件的自定义详情
-        test_case_info_file = [] #存储每个文件内测试用例信息
+    #先查类
+    for cmd in tqdm(compile_cmd, desc="Parsing unit test code", unit="cmd"):
+        call_graph_all = {}
+        root_cursor, src_file = parse_source_file_and_get_cursor(cmd)  # 获取某个单元测试的 AST 的根游标
+        method_definitions = []  # 存储当前文件的方法定义详情
+        test_case_info_file = []  # 存储每个文件内测试用例信息
         include_directives = set()
 
-        for cursor in root_cursor.walk_preorder():
+        #此处判断是否为单元测试，如果不在单元测试指定dir中，就continue
+        if not is_path_contained_in(unit_test_dir, src_file):
+            continue
 
-            if (
-                    cursor.kind in (cindex.CursorKind.FUNCTION_DECL, cindex.CursorKind.CXX_METHOD, cindex.CursorKind.FUNCTION_TEMPLATE) and
-                    cursor.is_definition() and
-                    cursor.location.file.name == src_file and
-                    cursor.spelling != "TestBody"
-            ):
-                method_definition_detail = pack_function_definitions(cursor)
-                method_definitions.append(method_definition_detail)
+        # 初始化辅助列表
+        class_cursor_list = []
 
-            #取引入的头文件
-            if cursor.kind == cindex.CursorKind.INCLUSION_DIRECTIVE and is_path_contained_in(unit_test_dir, cursor.location.file.name) :
-                include_file = cursor.get_included_file().name
-                if not is_path_contained_in_any(ignore_header_path, include_file):
-                    include_directives.add(cursor.spelling)
-
-            parent_class = cursor.semantic_parent
-            if cursor.spelling == "TestBody" and parent_class.kind == cindex.CursorKind.CLASS_DECL and cursor.is_definition():
-
-                # 取本方法定义位置
-                testBody_file = cursor.location.file.name
-                testBody_start_line = cursor.extent.start.line
-                testBody_end_line = cursor.extent.end.line
-
-                testBody_definition_info = {
-                    "file": testBody_file,
-                    "start_line": testBody_start_line,
-                    "end_line": testBody_end_line
-                }
-
-                # 获取最终基类及其链表
-                final_base_class, class_cursor_list = get_final_gtest_base_class(parent_class, root_cursor)
-
-                # 对 TEST 宏进行分析
-                if is_derived_from_testing_test(parent_class):  # 判断是否直接继承自 ::testing::TEST
-                    testbody =  build_testbody(
-                                cursor=cursor,
-                                target_function_call=target_function_call,
-                                unit_test_dir=unit_test_dir,
-                                ignore_type_path=ignore_type_path,
-                                testBody_definition_info=testBody_definition_info
-                            )
-
-                    test_case = {
-                        "macro": "TEST",
-                        "include_directives": list(include_directives),
-                        "testbody": testbody,  # 使用提前定义的 testbody
-                    }
-
-                    test_case_info_file.append(test_case)
-
-                else:
-                    if final_base_class == "Test": #说明是TEST_F宏
-                        macro = "TEST_F"
-                        test_case = analyze_test_p_macro(
-                            cursor=cursor,
-                            class_cursor_list=class_cursor_list,
-                            target_function_call=target_function_call,
-                            unit_test_dir=unit_test_dir,
-                            ignore_type_path=ignore_type_path,
-                            testBody_definition_info=testBody_definition_info,
-                            include_directives=include_directives,
-                            macro=macro
-                        )
-                        test_case_info_file.append(test_case)
-
-                    #对TESST_P宏分析
-                    elif final_base_class == "TestWithParam": #说明是TEST_P宏
-                        macro = "TEST_P"
-                        test_case = analyze_test_p_macro(
-                            cursor=cursor,
-                            class_cursor_list=class_cursor_list,
-                            target_function_call=target_function_call,
-                            unit_test_dir=unit_test_dir,
-                            ignore_type_path=ignore_type_path,
-                            testBody_definition_info=testBody_definition_info,
-                            include_directives=include_directives,
-                            macro=macro
-                        )
-                        test_case_info_file.append(test_case)
+        # 遍历根游标的直接子节点
+        for cursor in root_cursor.get_children():
+            process_cursor(
+                cursor=cursor,
+                root_cursor=root_cursor,
+                src_file=src_file,
+                method_definitions=method_definitions,
+                test_case_info_file=test_case_info_file,
+                include_directives=include_directives,
+                class_cursor_list=class_cursor_list,
+                call_graph_all=call_graph_all,
+                unit_test_dir=unit_test_dir,
+                target_function_call=target_function_call,
+                ignore_type_path=ignore_type_path,
+                ignore_header_path=ignore_header_path
+            )
 
 
-        file_method_definitions[src_file] = method_definitions
-        test_case_info_all[src_file] = test_case_info_file
+        file_method_definitions = {src_file: method_definitions}
+        test_case_info_all = {src_file: test_case_info_file}
 
+        write_dict_to_json_in_dir(call_graph_all, unit_test_dir, 'call_graph_all.json')
         write_dict_to_json_in_dir(file_method_definitions, unit_test_dir, 'method_definitions.json')
-        write_dict_to_json_in_dir(test_case_info_all,unit_test_dir,'testCase_info.json')
+        write_dict_to_json_in_dir(test_case_info_all, unit_test_dir, 'testCase_info.json')
+
+
+
 
 # 主程序入口
 if __name__ == '__main__':
