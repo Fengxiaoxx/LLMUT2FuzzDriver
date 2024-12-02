@@ -11,12 +11,12 @@ cindex.Config.set_library_file('/usr/lib/llvm-15/lib/libclang.so.1')
 
 def get_function_call_graph(cursor: cindex.Cursor, unit_test_dir: str) -> List[str]:
 
-    called_function_list = []
+    called_function_list = set()
 
     if cursor.is_definition():
         for child in cursor.walk_preorder():
             # 检查当前节点是否是函数调用
-            if child.kind == cindex.CursorKind.CALL_EXPR:
+            if child.kind == cindex.CursorKind.CALL_EXPR and child.spelling != cursor.spelling: #防止递归调用
                 referenced = child.referenced
                 if referenced is not None and referenced.location.file is not None:
                     try:
@@ -31,7 +31,7 @@ def get_function_call_graph(cursor: cindex.Cursor, unit_test_dir: str) -> List[s
                                 file_without_extension = os.path.splitext(called_function_def_file)[0]
                                 # 拼接函数标识符
                                 function_identifier = f"{file_without_extension} | {called_function_name}"
-                                called_function_list.append(function_identifier)
+                                called_function_list.add(function_identifier) #去重
                     except AttributeError as e:
                         # 捕获可能的异常，例如引用或定义的属性不存在
                         print(f"AttributeError encountered: {e}")
@@ -39,7 +39,7 @@ def get_function_call_graph(cursor: cindex.Cursor, unit_test_dir: str) -> List[s
                         # 捕获其他异常并打印日志以供调试
                         print(f"Unexpected error encountered: {e}")
 
-    return called_function_list
+    return list(called_function_list)
 
 
 def analyze_test_p_macro(
@@ -61,7 +61,8 @@ def analyze_test_p_macro(
         target_function_call=target_function_call,
         unit_test_dir=unit_test_dir,
         ignore_type_path=ignore_type_path,
-        testBody_definition_info=testBody_definition_info
+        testBody_definition_info=testBody_definition_info,
+        target_lib_dir=target_lib_dir
     )
 
     # 解析测试夹具
@@ -95,10 +96,12 @@ def analyze_test_p_macro(
             if child.kind == cindex.CursorKind.FIELD_DECL:
                 for filed_child in child.get_children():
                     if filed_child.kind == cindex.CursorKind.TYPE_REF:
-                        field_type_in_fixture.append(filed_child.referenced)
+                        filed_child_referenced_name = filed_child.location.file.name
+                        if is_path_contained_in(target_lib_dir,filed_child_referenced_name):
+                            field_type_in_fixture.append(filed_child.referenced)
 
             for field_type_ref in field_type_in_fixture:
-                field_type_def = get_type_ref_definition(field_type_ref)
+                field_type_def = get_type_ref_definition(field_type_ref,target_lib_dir)
                 type_def_list_in_fixture.append(field_type_def)
 
             # 分析成员函数
@@ -189,7 +192,7 @@ def build_cxxmethod(
         target_function_calls,
         aux_function_cursor_list,
         type_ref_list
-    ) = collect_function_call_details(cursor, target_function_call, unit_test_dir, ignore_type_path)
+    ) = collect_function_call_details(cursor, target_function_call, unit_test_dir, ignore_type_path,target_lib_dir)
 
     # 填充辅助函数定义列表
     for aux_function_cursor in aux_function_cursor_list:
@@ -197,7 +200,7 @@ def build_cxxmethod(
 
     # 填充类型定义列表
     for type_ref in type_ref_list:
-        type_definition_list.append(get_type_ref_definition(type_ref))
+        type_definition_list.append(get_type_ref_definition(type_ref,target_lib_dir))
 
     # 构造 testbody 字典
     return {
@@ -214,6 +217,7 @@ def build_testbody(
     unit_test_dir: str,
     ignore_type_path: List[str],
     testBody_definition_info: Dict[str, Any],
+    target_lib_dir:str
 ) -> Dict[str, Any]:
 
     # 初始化辅助函数和类型定义列表
@@ -229,7 +233,7 @@ def build_testbody(
         target_function_calls,
         aux_function_cursor_list,
         type_ref_list
-    ) = collect_function_call_details(cursor, target_function_call, unit_test_dir, ignore_type_path)
+    ) = collect_function_call_details(cursor, target_function_call, unit_test_dir, ignore_type_path,target_lib_dir)
 
     # 填充辅助函数定义列表
     for aux_function_cursor in aux_function_cursor_list:
@@ -237,7 +241,7 @@ def build_testbody(
 
     # 填充类型定义列表
     for type_ref in type_ref_list:
-        type_definition_list.append(get_type_ref_definition(type_ref))
+        type_definition_list.append(get_type_ref_definition(type_ref,target_lib_dir))
 
     # 构造 testbody 字典
     return {
@@ -248,56 +252,69 @@ def build_testbody(
     }
 
 
-def get_type_ref_definition(cursor_reference: cindex.Cursor) -> Dict:
+def get_type_ref_definition(cursor_reference: cindex.Cursor,target_lib_dir:str) -> Optional[Dict]:
 
     cursor_ref_def_file = cursor_reference.location.file.name
     cursor_ref_def_start_line = cursor_reference.extent.start.line
     cursor_ref_def_end_line = cursor_reference.extent.end.line
+    if is_path_contained_in(target_lib_dir, cursor_ref_def_file):
+        if cursor_reference.kind == cindex.CursorKind.TYPEDEF_DECL:
+            # 获取 typedef 声明对应的类型声明
+            typedef_type = cursor_reference.underlying_typedef_type
+            typedef_decl = typedef_type.get_declaration()
 
-    if cursor_reference.kind == cindex.CursorKind.TYPEDEF_DECL:
-        # 获取 typedef 声明对应的类型声明
-        typedef_type = cursor_reference.underlying_typedef_type
-        typedef_decl = typedef_type.get_declaration()
+            #借助extent来区分typedef和decl是不是写在一起了
+            if not typedef_decl.extent == cursor_reference.extent and typedef_decl.location.file is not None:
 
-        #借助extent来区分
-        if not typedef_decl.extent == cursor_reference.extent and typedef_decl.location.file is not None:
+                cursor_underlying_file = typedef_decl.location.file.name
+                cursor_underlying_start_line = typedef_decl.extent.start.line
+                cursor_underlying_end_line = typedef_decl.extent.end.line
 
-            cursor_underlying_file = typedef_decl.location.file.name
-            cursor_underlying_start_line = typedef_decl.extent.start.line
-            cursor_underlying_end_line = typedef_decl.extent.end.line
-            #flag用来标记两种类型：True：具有底层type；False：定义和typedef在一起
-            type_def_info = {
-                'flag': True,
-                'type_def':{
-                    'file': cursor_ref_def_file,
-                    'start_line': cursor_ref_def_start_line,
-                    'end_line': cursor_ref_def_end_line,
-                    },
-                'underlying_type':{
-                    'file': cursor_underlying_file,
-                    'start_line': cursor_underlying_start_line,
-                    'end_line': cursor_underlying_end_line,
+                if is_path_contained_in(target_lib_dir,cursor_underlying_file):
+                #flag用来标记两种类型：True：具有底层type；False：定义和typedef在一起
+                    type_def_info = {
+                        'flag': True,
+                        'type_def':{
+                            'file': cursor_ref_def_file,
+                            'start_line': cursor_ref_def_start_line,
+                            'end_line': cursor_ref_def_end_line,
+                            },
+                        'underlying_type':{
+                            'file': cursor_underlying_file,
+                            'start_line': cursor_underlying_start_line,
+                            'end_line': cursor_underlying_end_line,
+                        }
+                    }
+                else:
+                    type_def_info = {
+                        'flag': False,
+                        'type_def':{
+                            'file': cursor_ref_def_file,
+                            'start_line': cursor_ref_def_start_line,
+                            'end_line': cursor_ref_def_end_line,
+                            }
+                    }
+            else:
+                type_def_info = {
+                    'flag': False,
+                    'type_def':{
+                        'file': cursor_ref_def_file,
+                        'start_line': cursor_ref_def_start_line,
+                        'end_line': cursor_ref_def_end_line,
+                        }
                 }
-            }
         else:
             type_def_info = {
                 'flag': False,
-                'type_def':{
+                'type_def': {
                     'file': cursor_ref_def_file,
                     'start_line': cursor_ref_def_start_line,
                     'end_line': cursor_ref_def_end_line,
-                    }
+                }
             }
+        return type_def_info
     else:
-        type_def_info = {
-            'flag': False,
-            'type_def': {
-                'file': cursor_ref_def_file,
-                'start_line': cursor_ref_def_start_line,
-                'end_line': cursor_ref_def_end_line,
-            }
-        }
-    return type_def_info
+        return None
 
 
 def get_aux_function_definition(cursor_reference: cindex.Cursor) -> Optional[Dict[str, Any]]:
@@ -308,12 +325,20 @@ def get_aux_function_definition(cursor_reference: cindex.Cursor) -> Optional[Dic
         isSrcCode = cursor_reference.is_definition()
 
         if cursor_reference.location.file and cursor_reference.extent:
-            aux_function_info = {
-                'file': cursor_reference.location.file.name,
-                'start_line': cursor_reference.extent.start.line,
-                'end_line': cursor_reference.extent.end.line,
-                'isSrcCode': isSrcCode
-            }
+            if isSrcCode:
+                aux_function_info = {
+                    'file': cursor_reference.location.file.name,
+                    "aux_function_name": cursor_reference.spelling,
+                    'start_line': cursor_reference.extent.start.line,
+                    'end_line': cursor_reference.extent.end.line,
+                    'isSrcCode': isSrcCode
+                }
+            else:
+                aux_function_info = {
+                    'file': cursor_reference.location.file.name,
+                    "aux_function_name": cursor_reference.spelling,
+                    'isSrcCode': isSrcCode
+                }
             return aux_function_info
         else:
             return None
@@ -358,7 +383,8 @@ def collect_function_call_details(
         testBody: cindex.Cursor,
         target_function_call: List,
         unit_test_dir: str,
-        ignore_type_path:List) -> Tuple[List[str], List[cindex.Cursor], List[cindex.Cursor]]:
+        ignore_type_path:List,
+        target_lib_dir:str) -> Tuple[List[str], List[cindex.Cursor], List[cindex.Cursor]]:
     if not testBody or not target_function_call:
         return [], [], []
 
@@ -383,8 +409,14 @@ def collect_function_call_details(
                 referenced = cursor.referenced
                 ref_loc = referenced.location.file.name
                 ref_spelling = referenced.spelling
-                if is_valid_type_ref(referenced) and not  is_path_contained_in_any(ignore_type_path,ref_loc) and not ref_spelling.endswith("_Test"):
+                if (
+                        is_valid_type_ref(referenced)
+                        and not is_path_contained_in_any(ignore_type_path, ref_loc)
+                        and not ref_spelling.endswith("_Test")
+                        and is_path_contained_in(target_lib_dir, ref_loc)
+                ):
                     type_ref_list.add(referenced)
+
 
     except Exception as e:
         print(f"Error occurred: {e}")
@@ -521,7 +553,21 @@ def parse_source_file_and_get_cursor(cmd: cindex.CompileCommand) -> Tuple[cindex
     return tu.cursor, src_file
 
 
-def process_cursor(cursor, root_cursor, src_file, method_definitions, test_case_info_file, include_directives, class_cursor_list, call_graph_all, unit_test_dir, target_function_call, ignore_type_path, ignore_header_path):
+def process_cursor(
+    cursor: Cursor,
+    root_cursor: Cursor,
+    src_file: str,
+    method_definitions: List[dict],
+    test_case_info_file: List[dict],
+    include_directives: Set[str],
+    class_cursor_list: List[Cursor],
+    call_graph_all: Dict[str, List[str]],
+    unit_test_dir: str,
+    target_function_call: List[str],
+    ignore_type_path: List[str],
+    ignore_header_path: List[str],
+    target_lib_dir: str
+) -> None:
     """
     递归地处理游标及其子游标，针对 namespace 和 class 进行深入遍历
     """
@@ -576,7 +622,8 @@ def process_cursor(cursor, root_cursor, src_file, method_definitions, test_case_
                 target_function_call=target_function_call,
                 unit_test_dir=unit_test_dir,
                 ignore_type_path=ignore_type_path,
-                testBody_definition_info=testBody_definition_info
+                testBody_definition_info=testBody_definition_info,
+                target_lib_dir=target_lib_dir
             )
 
             test_case = {
@@ -631,10 +678,19 @@ def process_cursor(cursor, root_cursor, src_file, method_definitions, test_case_
                 unit_test_dir=unit_test_dir,
                 target_function_call=target_function_call,
                 ignore_type_path=ignore_type_path,
-                ignore_header_path=ignore_header_path
+                ignore_header_path=ignore_header_path,
+                target_lib_dir=target_lib_dir
             )
 
-def main(compile_cmd_dir:str, target_function_call:list, unit_test_dir:str, ignore_type_path:List, ignore_header_path:List):
+
+def main(
+    compile_cmd_dir: str,
+    target_function_call: List[str],
+    unit_test_dir: str,
+    ignore_type_path: List[str],
+    ignore_header_path: List[str],
+    target_lib_dir: str
+) -> None:
     compile_cmd = load_compile_commands(compile_cmd_dir)
 
 
@@ -667,7 +723,8 @@ def main(compile_cmd_dir:str, target_function_call:list, unit_test_dir:str, igno
                 unit_test_dir=unit_test_dir,
                 target_function_call=target_function_call,
                 ignore_type_path=ignore_type_path,
-                ignore_header_path=ignore_header_path
+                ignore_header_path=ignore_header_path,
+                target_lib_dir=target_lib_dir
             )
 
 
@@ -683,15 +740,18 @@ def main(compile_cmd_dir:str, target_function_call:list, unit_test_dir:str, igno
 
 # 主程序入口
 if __name__ == '__main__':
+
+    target_lib_dir = '/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom'
+
     compile_cmd_dir = '/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom/build'
     unit_test_dir = '/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom/test'
     target_function_call = load_public_api('/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom_build').get('libaom.a')
 
     #指定忽略类型提取路径
-    ignore_type_path = ['/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom/third_party']
+    ignore_type_path = ['/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom/third_party','/usr/']
 
     #指定忽略头文件提取路径
     ignore_header_path = ['/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom/third_party','/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom/test']
 
     # 打印提取的每个单元测试文件中的 API 调用
-    main(compile_cmd_dir,target_function_call,unit_test_dir,ignore_type_path,ignore_header_path)
+    main(compile_cmd_dir,target_function_call,unit_test_dir,ignore_type_path,ignore_header_path,target_lib_dir)
