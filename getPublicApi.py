@@ -8,7 +8,7 @@ def append_functions_to_json(librarypath, output_file):
 
     # 使用 subprocess 执行 nm 命令，获取库文件中的所有符号
     result = subprocess.run(
-        ['nm', '--no-demangle', '--defined-only', '-g', librarypath],
+        ['nm', '--demangle', '--defined-only', '-g', librarypath],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True
@@ -42,8 +42,8 @@ def append_functions_to_json(librarypath, output_file):
 # 主程序
 if __name__ == "__main__":
     # 定义传入的库路径和输出文件路径
-    librarypath = "/workspace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom_build/libaom.a"  # 替换成你的库文件路径
-    output_file = "/workspace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom_build/public_api.json"  # 替换成你希望保存的 JSON 文件路径
+    librarypath = "/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom/build/libaom_gtest.a"  # 替换成你的库文件路径
+    output_file = "/media/fengxiao/3d47419b-aaf4-418e-8ddd-4f2c62bebd8b/workSpace/llmForFuzzDriver/DriverGnerationFromUT/targetLib/aom/build/libaom_gtest.json"  # 替换成你希望保存的 JSON 文件路径
 
     # 调用函数
     append_functions_to_json(librarypath, output_file)
