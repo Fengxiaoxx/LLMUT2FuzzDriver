@@ -1,6 +1,13 @@
 import json
 import os
 from clang.cindex import CompilationDatabase
+from clang import cindex
+
+def generate_unique_cursor_id(referenced: cindex.Cursor)->str:
+    if referenced and referenced.location and referenced.location.file:
+        referenced_file = referenced.location.file.name
+        referenced_line = referenced.location.line
+        return f'{referenced_file} [line: {referenced_line}]'
 
 
 def find_corresponding_source(header_path: str) -> str:
@@ -60,7 +67,7 @@ def load_compile_commands(path):
 # 加载公共 API
 def load_public_api(path):
     # 自动添加文件名 public_api.json
-    compile_commands_path = os.path.join(path, 'public_api.json')
+    compile_commands_path = os.path.join(path, 'api_list.json')
     with open(compile_commands_path, 'r') as file:
         return json.load(file)
 

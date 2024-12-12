@@ -1,4 +1,6 @@
 import json
+import warnings
+
 import networkx as nx
 from typing import List
 
@@ -34,7 +36,8 @@ def preorder_traverse_with_networkx(graph: nx.DiGraph, start_node: str) -> List[
     """
     # 检查节点是否在图中
     if start_node not in graph:
-        print(f"Function {start_node} not found in the graph.")
+        warnings.warn(f"Function {start_node} not found in the graph."
+                      f"This might be because the member function is declared in the test fixture but not defined.")
         return []
 
     # 初始化结果列表
