@@ -157,7 +157,7 @@ def get_var_info(cursor: cindex.Cursor, src_file: str, target_function_call: Lis
     返回值：
     - Dict - 包含变量信息的字典。
     """
-    var_def_file = src_file
+    var_def_file = cursor.location.file.name
     var_def_start_line = cursor.extent.start.line
     var_def_end_line = cursor.extent.end.line
     var_definition = {
@@ -213,23 +213,25 @@ def get_var_info(cursor: cindex.Cursor, src_file: str, target_function_call: Lis
 
 def get_function_call_graph(cursor: cindex.Cursor, unit_test_dir: str) -> List[str]:
 
-    # 取成员函数类型
-    cxx_method_type = (
+    # 取函数类型
+    function_type = (
         cindex.CursorKind.CXX_METHOD,
         cindex.CursorKind.FUNCTION_TEMPLATE,
         cindex.CursorKind.CONSTRUCTOR,
         cindex.CursorKind.DESTRUCTOR,
-        cindex.CursorKind.CONVERSION_FUNCTION
+        cindex.CursorKind.CONVERSION_FUNCTION,
+        cindex.CursorKind.FUNCTION_DECL
     )
     called_function_list = set()
 
     if cursor.is_definition():
         for child in cursor.walk_preorder():
+
             # 检查当前节点是否是函数调用
             if child.kind == cindex.CursorKind.CALL_EXPR and child.spelling != cursor.spelling:  # 防止递归调用
                 referenced = child.referenced
 
-                if referenced and referenced.location.file and referenced.kind in cxx_method_type:
+                if referenced and referenced.location.file and referenced.kind in function_type:
                     try:
                         referenced_path = referenced.location.file.name
                         # 检查路径是否在指定目录中
@@ -238,15 +240,7 @@ def get_function_call_graph(cursor: cindex.Cursor, unit_test_dir: str) -> List[s
                             front_1 = referenced.get_usr()
                             back_1 = generate_unique_cursor_id(referenced)
                             called_function_name = f'{front_1} & {back_1}'
-                            # 检查是否有定义并获取定义文件路径
-                            definition = referenced.get_definition()
-                            if definition and definition.location.file:
-                                called_function_def_file = definition.location.file.name
-                                #file_without_extension = os.path.splitext(called_function_def_file)[0]
-                                # 拼接函数标识符
-                                #function_identifier = f"{file_without_extension} | {called_function_name}"
-                                #called_function_list.add(function_identifier)  # 去重
-                                called_function_list.add(called_function_name)  # 去重
+                            called_function_list.add(called_function_name)  # 去重
                     except AttributeError as e:
                         # 捕获可能的异常
                         print(f"AttributeError encountered: {e}")
@@ -266,8 +260,14 @@ def analyze_test_p_macro(
 ) -> Dict[str, Any]:
 
     fixture_class_info_list: List[Dict[str, Any]] = []  # 存储测试夹具中的信息
+    parent_class = cursor.semantic_parent
 
     test_case_id = cursor.semantic_parent.spelling.split("_")[0]
+
+    for child in parent_class.get_children():
+        if child.kind == cindex.CursorKind.CXX_BASE_SPECIFIER:
+            test_case_id = child.referenced.spelling
+
     # 解析测试夹具
     for class_cursor in class_cursor_list[1:]:  # 取每个测试夹具的源码
         fixture_class_name = class_cursor.spelling
@@ -498,6 +498,7 @@ def get_final_gtest_base_class(
 
     # 检查当前类的文件是否在忽略路径中
     class_file = class_cursor.location.file
+    #print(class_cursor.spelling,"==>",class_cursor.kind,"==>",class_file)
     if class_file and not is_path_contained_in_any(ignore_type_path, class_file.name):
         class_cursor_list.append(class_cursor)  # 保存当前类的 cursor
 
@@ -509,7 +510,6 @@ def get_final_gtest_base_class(
     if class_cursor.kind not in [cindex.CursorKind.CLASS_DECL, cindex.CursorKind.CLASS_TEMPLATE]:
     #if class_cursor.kind not in [cindex.CursorKind.CLASS_DECL]:
         return result_final, class_cursor_list
-
     # 防止循环继承导致的无限递归
     class_usr = class_cursor.get_usr()
     if class_usr in checked_classes:
@@ -521,18 +521,17 @@ def get_final_gtest_base_class(
         if class_def.spelling == class_cursor.spelling:
             base_class_list.append(class_def)
             break
-
     # 遍历基类，递归查找最终基类
     for base_cursor in base_class_list:
         for base in base_cursor.get_children():
             if base.kind == cindex.CursorKind.CXX_BASE_SPECIFIER:
-                base_type = base.type
+                base_type = base.type.get_canonical()
                 base_decl = base_type.get_declaration()
                 base_usr = base_decl.get_usr()
                 # 检查基类是否为 GTest 类型
                 if base_usr == 'c:@N@testing@S@Test':
                     result_final = 'Test'
-                elif base_usr.startswith('c:@N@testing@ST>1#T@TestWithParam'):
+                elif base_usr.startswith('c:@N@testing@ST>1#T@TestWithParam') or base_usr.startswith('c:@N@testing@ST>1#T@WithParamInterface'):
                     result_final = 'TestWithParam'
                 else:
                     # 递归检查基类
@@ -671,8 +670,6 @@ def process_cursor(
 
         call_graph_all[cxx_id] = called_list
 
-
-
     if cursor.spelling.startswith("gtest_") and cursor.spelling.endswith("_EvalGenerator_") and cursor.kind == cindex.CursorKind.FUNCTION_DECL:
         target_function_call_in_evalgen = set()
         var_ref_in_evalgen = set()
@@ -729,9 +726,10 @@ def process_cursor(
                 testcase_to_evalgen[test_case_name].append(eval_generator_id)
 
 
-
+    ###not is_path_contained_in_any(ignore_type_path, cursor.location.file.name) and is_path_contained_in(target_lib_dir, cursor.location.file.name)根据这里改一下
     #解析变量，因为其可能传入参数生成器
-    if cursor.kind == cindex.CursorKind.VAR_DECL and cursor.location.file.name == src_file and not (cursor.spelling.startswith("gtest_") and cursor.spelling.endswith("_dummy_")):
+    if (cursor.kind == cindex.CursorKind.VAR_DECL and not (cursor.spelling.startswith("gtest_") and cursor.spelling.endswith("_dummy_")) and
+             is_path_contained_in(unit_test_dir, cursor.location.file.name)):
         var_info = get_var_info(cursor,src_file,target_function_call,method_type,unit_test_dir,target_lib_dir)
         var_id = cursor.get_usr()
         var_infos[var_id]=var_info
@@ -755,6 +753,10 @@ def process_cursor(
         if not is_path_contained_in_any(ignore_header_path, include_file):
             include_directives.add(cursor.spelling)
 
+
+
+
+
     # 处理 TestBody
     if cursor.spelling == "TestBody" and cursor.semantic_parent.kind == cindex.CursorKind.CLASS_DECL and cursor.is_definition():
         parent_class = cursor.semantic_parent
@@ -762,7 +764,6 @@ def process_cursor(
         final_base_class, class_cursor_list = get_final_gtest_base_class(
             parent_class, root_cursor, class_cursor_list, ignore_type_path
         )
-
 
         if is_derived_from_testing_test(parent_class):  # 判断是否直接继承自 ::testing::TEST
 
@@ -775,6 +776,7 @@ def process_cursor(
             })
         elif final_base_class in {"Test", "TestWithParam"}:  # 处理 TEST_F 和 TEST_P
             macro = "TEST_F" if final_base_class == "Test" else "TEST_P"
+
             test_case = analyze_test_p_macro(
                 cursor=cursor,
                 class_cursor_list=class_cursor_list,
