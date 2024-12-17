@@ -127,7 +127,7 @@ def determine_if_is_fixture(
                 # 检查基类是否为 GTest 类型
                 if base_usr == 'c:@N@testing@S@Test':
                     result_final = 'Test'
-                elif base_usr.startswith('c:@N@testing@ST>1#T@TestWithParam'):
+                elif base_usr.startswith('c:@N@testing@ST>1#T@TestWithParam') or base_usr.startswith('c:@N@testing@ST>1#T@WithParamInterface'):
                     result_final = 'TestWithParam'
                 else:
                     # 递归检查基类
@@ -256,7 +256,8 @@ def analyze_test_p_macro(
         class_cursor_list: List[cindex.Cursor],
         include_directives: Set[str],
         macro: str,
-        target_lib_dir:str
+        target_lib_dir:str,
+        macro_definitions:List[dict]
 ) -> Dict[str, Any]:
 
     fixture_class_info_list: List[Dict[str, Any]] = []  # 存储测试夹具中的信息
@@ -342,6 +343,7 @@ def analyze_test_p_macro(
         "test_case_id":test_case_id,
         "testbody_id":f'{front_3} & {back_3}',
         "include_directives": list(include_directives),
+        "macro_definition":macro_definitions,
         "fixture_class": fixture_class_info_list
     }
 
@@ -410,6 +412,7 @@ def pack_function_definitions(cursor: cindex.Cursor, target_function_call: List[
 
 
     function_info = {
+        'spelling':cursor.spelling,
         'kind': str(cursor.kind),
         'file':cursor.location.file.name,
         'start_line': cursor.extent.start.line,
@@ -620,7 +623,7 @@ def process_cursor(
     src_file: str,
     method_definitions: Dict,
     test_case_info_file: List[dict],
-    include_directives: Set[str],
+    include_directives:Set[str],
     class_cursor_list: List[Cursor],
     call_graph_all: Dict[str, List[str]],
     unit_test_dir: str,
@@ -631,7 +634,8 @@ def process_cursor(
     var_infos:Dict,
     class_infos:Dict,
     evalgen_infos:Dict,
-    testcase_to_evalgen:Dict
+    testcase_to_evalgen:Dict,
+    macro_definitions:list[dict]
 ) -> None:
 
     """
@@ -726,7 +730,6 @@ def process_cursor(
                 testcase_to_evalgen[test_case_name].append(eval_generator_id)
 
 
-    ###not is_path_contained_in_any(ignore_type_path, cursor.location.file.name) and is_path_contained_in(target_lib_dir, cursor.location.file.name)根据这里改一下
     #解析变量，因为其可能传入参数生成器
     if (cursor.kind == cindex.CursorKind.VAR_DECL and not (cursor.spelling.startswith("gtest_") and cursor.spelling.endswith("_dummy_")) and
              is_path_contained_in(unit_test_dir, cursor.location.file.name)):
@@ -734,10 +737,9 @@ def process_cursor(
         var_id = cursor.get_usr()
         var_infos[var_id]=var_info
 
-    #解析类，因为其可能会被参数生成器使用
-    if cursor.kind in (cindex.CursorKind.CLASS_DECL,cindex.CursorKind.CLASS_TEMPLATE) and determine_if_is_fixture(
-            cursor, root_cursor, class_cursor_list, ignore_type_path
-        ) == 'None':
+    # 解析类，因为其可能会被参数生成器使用
+    if cursor.kind in (cindex.CursorKind.CLASS_DECL, cindex.CursorKind.CLASS_TEMPLATE):
+
         class_referenced = cursor.referenced
         if class_referenced and is_path_contained_in(unit_test_dir,class_referenced.location.file.name):
             class_info = analyze_class(class_referenced,target_lib_dir)
@@ -746,16 +748,23 @@ def process_cursor(
             class_id = f'{front_9} & {back_9}'
             class_infos[class_id] = class_info
 
+    if cursor.kind == cindex.CursorKind.MACRO_DEFINITION and cursor.location.file and is_path_contained_in(unit_test_dir,cursor.location.file.name):
+        file = cursor.location.file.name
+        start_line = cursor.extent.start.line
+        end_line = cursor.extent.end.line
+        if start_line != end_line:
+            macro_info = {
+                'file': file,
+                'start_line': start_line,
+                'end_line': end_line
+            }
+            macro_definitions.append(macro_info)
 
     # 取引入的头文件
     if cursor.kind == cindex.CursorKind.INCLUSION_DIRECTIVE and is_path_contained_in(unit_test_dir, cursor.location.file.name):
         include_file = cursor.get_included_file().name
         if not is_path_contained_in_any(ignore_header_path, include_file):
-            include_directives.add(cursor.spelling)
-
-
-
-
+            include_directives.add(include_file)
 
     # 处理 TestBody
     if cursor.spelling == "TestBody" and cursor.semantic_parent.kind == cindex.CursorKind.CLASS_DECL and cursor.is_definition():
@@ -772,6 +781,7 @@ def process_cursor(
             test_case_info_file.append({
                 "macro": "TEST",
                 "include_directives": list(include_directives),
+                "macro_definition":list(macro_definitions),
                 "testbody_id": f'{front_5} & {back_5}'
             })
         elif final_base_class in {"Test", "TestWithParam"}:  # 处理 TEST_F 和 TEST_P
@@ -782,7 +792,8 @@ def process_cursor(
                 class_cursor_list=class_cursor_list,
                 include_directives=include_directives,
                 macro=macro,
-                target_lib_dir=target_lib_dir
+                target_lib_dir=target_lib_dir,
+                macro_definitions = macro_definitions
             )
             test_case_info_file.append(test_case)
 
@@ -813,92 +824,9 @@ def process_cursor(
                 var_infos=var_infos,
                 class_infos=class_infos,
                 evalgen_infos=evalgen_infos,
-                testcase_to_evalgen=testcase_to_evalgen
+                testcase_to_evalgen=testcase_to_evalgen,
+                macro_definitions=macro_definitions
             )
-
-'''
-def process_cursor(
-    root_cursor: Cursor,
-    src_file: str,
-    method_definitions: Dict,
-    test_case_info_file: List[dict],
-    include_directives: Set[str],
-    class_cursor_list: List[Cursor],
-    call_graph_all: Dict[str, List[str]],
-    unit_test_dir: str,
-    target_function_call: List[str],
-    ignore_type_path: List[str],
-    ignore_header_path: List[str],
-) -> None:
-    """
-    非递归地处理游标及其子游标，使用 walk_preorder 遍历
-    """
-
-    # 使用栈进行遍历
-    for cursor in root_cursor.walk_preorder():
-
-        # 处理类声明
-        if cursor.kind in [cindex.CursorKind.CLASS_DECL,cindex.CursorKind.CLASS_TEMPLATE]:
-            class_cursor_list.append(cursor)
-
-        method_type = (
-            cindex.CursorKind.CXX_METHOD,
-            cindex.CursorKind.FUNCTION_TEMPLATE,
-            cindex.CursorKind.CONSTRUCTOR,
-            cindex.CursorKind.DESTRUCTOR,
-            cindex.CursorKind.CONVERSION_FUNCTION,
-            cindex.CursorKind.FUNCTION_DECL
-        )
-
-        # 处理函数定义
-        if (
-            cursor.kind in method_type and
-            cursor.is_definition() and
-            (cursor.location.file.name == src_file or
-             (is_path_contained_in(unit_test_dir, cursor.location.file.name) and os.path.splitext(cursor.location.file.name)[1] in [".h", ".hpp"]))
-        ):
-            method_definition_detail = pack_function_definitions(cursor, target_function_call)
-
-            #cxx_id = cursor.get_usr()
-            cxx_id = generate_unique_cursor_id(cursor)
-            method_definitions[cxx_id] = method_definition_detail
-
-            #function_identifier = cursor.get_usr()
-            called_list = get_function_call_graph(cursor, unit_test_dir)
-
-            call_graph_all[cxx_id] = called_list
-
-        # 取引入的头文件
-        if cursor.kind == cindex.CursorKind.INCLUSION_DIRECTIVE and is_path_contained_in(unit_test_dir, cursor.location.file.name):
-            include_file = cursor.get_included_file().name
-            if not is_path_contained_in_any(ignore_header_path, include_file):
-                include_directives.add(cursor.spelling)
-
-        # 处理 TestBody
-        if cursor.spelling == "TestBody" and cursor.semantic_parent.kind == cindex.CursorKind.CLASS_DECL and cursor.is_definition():
-            parent_class = cursor.semantic_parent
-            final_base_class, class_cursor_list = get_final_gtest_base_class(
-                parent_class, root_cursor, class_cursor_list, ignore_type_path
-            )
-
-            if is_derived_from_testing_test(parent_class):  # 判断是否直接继承自 ::testing::TEST
-                test_case_info_file.append({
-                    "macro": "TEST",
-                    "include_directives": list(include_directives),
-                    #"testbody_id": cursor.get_usr()
-                    "testbody_id": generate_unique_cursor_id(cursor)
-                })
-            elif final_base_class in {"Test", "TestWithParam"}:  # 处理 TEST_F 和 TEST_P
-                macro = "TEST_F" if final_base_class == "Test" else "TEST_P"
-                test_case = analyze_test_p_macro(
-                    cursor=cursor,
-                    class_cursor_list=class_cursor_list,
-                    include_directives=include_directives,
-                    macro=macro
-                )
-                test_case_info_file.append(test_case)
-'''
-
 
 def main(
     compile_cmd_dir: str,
@@ -918,6 +846,7 @@ def main(
         method_definitions = {}
         test_case_info_file = []
         include_directives = set()
+        macro_definitions = []
         var_infos = {}
         class_infos = {}
         evalgen_infos = {}
@@ -952,7 +881,8 @@ def main(
                 var_infos=var_infos,
                 class_infos=class_infos,
                 evalgen_infos=evalgen_infos,
-                testcase_to_evalgen=testcase_to_evalgen
+                testcase_to_evalgen=testcase_to_evalgen,
+                macro_definitions = macro_definitions
             )
 
 
